@@ -38,6 +38,7 @@ mod ping;
 mod reportgen;
 
 pub use metrics::Metrics;
+pub use reportgen::MappedAddr;
 use reportgen::ProbeProto;
 pub use reportgen::QuicConfig;
 
@@ -642,6 +643,7 @@ impl Actor {
             quic_config,
             ..
         } = opts;
+        trace!("Attempting probes for protocols {protos:#?}");
         if self.current_report_run.is_some() {
             response_tx
                 .send(Err(anyhow!(
