@@ -999,6 +999,7 @@ impl Actor {
                     return Ok(msg);
                 }
                 Err(e) => {
+                    trace!("receive client error: {:?}", e);
                     self.close_for_reconnect().await;
                     if self.is_closed {
                         return Err(ClientError::Closed);

@@ -6,6 +6,7 @@ use anyhow::{bail, ensure, Context as _, Result};
 use bytes::Bytes;
 use derive_more::Debug;
 use futures_lite::FutureExt;
+use futures_util::SinkExt;
 use http::{header::CONNECTION, response::Builder as ResponseBuilder};
 use hyper::{
     body::Incoming,
@@ -27,10 +28,13 @@ use tokio_tungstenite::{
 use tokio_util::{codec::Framed, sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{debug, debug_span, error, info, info_span, trace, warn, Instrument};
 
+use super::AccessConfig;
 use crate::{
     defaults::DEFAULT_KEY_CACHE_CAPACITY,
     http::{Protocol, LEGACY_RELAY_PATH, RELAY_PATH, SUPPORTED_WEBSOCKET_VERSION},
-    protos::relay::{recv_client_key, RelayCodec, PER_CLIENT_SEND_QUEUE_DEPTH, PROTOCOL_VERSION},
+    protos::relay::{
+        recv_client_key, Frame, RelayCodec, PER_CLIENT_SEND_QUEUE_DEPTH, PROTOCOL_VERSION,
+    },
     server::{
         actor::{Message, ServerActorTask},
         client_conn::ClientConnConfig,
@@ -165,6 +169,8 @@ pub(super) struct ServerBuilder {
     client_rx_ratelimit: Option<ClientConnRateLimit>,
     /// The capacity of the key cache.
     key_cache_capacity: usize,
+    /// Access config for nodes.
+    access: AccessConfig,
 }
 
 impl ServerBuilder {
@@ -177,7 +183,14 @@ impl ServerBuilder {
             headers: HeaderMap::new(),
             client_rx_ratelimit: None,
             key_cache_capacity: DEFAULT_KEY_CACHE_CAPACITY,
+            access: AccessConfig::Everyone,
         }
+    }
+
+    /// Set the access configuration.
+    pub(super) fn access(mut self, access: AccessConfig) -> Self {
+        self.access = access;
+        self
     }
 
     /// Serves all requests content using TLS.
@@ -230,6 +243,7 @@ impl ServerBuilder {
             server_task.write_timeout,
             self.client_rx_ratelimit,
             KeyCache::new(self.key_cache_capacity),
+            self.access,
         );
 
         let addr = self.addr;
@@ -313,6 +327,7 @@ struct Inner {
     write_timeout: Duration,
     rate_limit: Option<ClientConnRateLimit>,
     key_cache: KeyCache,
+    access: AccessConfig,
 }
 
 impl RelayService {
@@ -519,6 +534,17 @@ impl Inner {
             .await
             .context("unable to receive client information")?;
 
+        trace!("accept: checking access: {:?}", self.access);
+        if !self.access.is_allowed(client_key) {
+            io.send(Frame::Health {
+                problem: Bytes::from_static(b"not authenticated"),
+            })
+            .await?;
+            io.flush().await?;
+
+            bail!("client is not authenticated: {}", client_key);
+        }
+
         if info.version != PROTOCOL_VERSION {
             bail!(
                 "unexpected client version {}, expected {}",
@@ -565,6 +591,7 @@ impl RelayService {
         write_timeout: Duration,
         rate_limit: Option<ClientConnRateLimit>,
         key_cache: KeyCache,
+        access: AccessConfig,
     ) -> Self {
         Self(Arc::new(Inner {
             handlers,
@@ -573,6 +600,7 @@ impl RelayService {
             write_timeout,
             rate_limit,
             key_cache,
+            access,
         }))
     }
 
@@ -940,6 +968,7 @@ mod tests {
             server_task.write_timeout,
             None,
             KeyCache::test(),
+            AccessConfig::Everyone,
         );
 
         // create client a and connect it to the server
@@ -1027,6 +1056,7 @@ mod tests {
             server_task.write_timeout,
             None,
             KeyCache::test(),
+            AccessConfig::Everyone,
         );
 
         // create client a and connect it to the server
