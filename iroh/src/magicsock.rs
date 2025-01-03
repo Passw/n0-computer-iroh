@@ -234,6 +234,8 @@ pub(crate) struct MagicSock {
     my_relay: Watchable<Option<RelayUrl>>,
     /// Tracks the networkmap node entity for each node discovery key.
     node_map: NodeMap,
+    /// Tracks the mapped IP addresses
+    ip_mapped_addrs: IpMappedAddrs,
     /// UDP IPv4 socket
     pconn4: UdpConn,
     /// UDP IPv6 socket
@@ -364,7 +366,7 @@ impl MagicSock {
     }
 
     /// Returns the socket address which can be used by the QUIC layer to dial this node.
-    pub(crate) fn get_mapping_addr(&self, node_id: NodeId) -> Option<QuicMappedAddr> {
+    pub(crate) fn get_mapping_addr(&self, node_id: NodeId) -> Option<NodeIdMappedAddr> {
         self.node_map.get_quic_mapped_addr_for_node_key(node_id)
     }
 
@@ -453,7 +455,7 @@ impl MagicSock {
             ));
         }
 
-        let dest = QuicMappedAddr(transmit.destination);
+        let dest = NodeIdMappedAddr(transmit.destination);
         trace!(
             dst = %dest,
             src = ?transmit.src_ip,
@@ -745,7 +747,7 @@ impl MagicSock {
     ///
     /// All the `bufs` and `metas` should have initialized packets in them.
     ///
-    /// This fixes up the datagrams to use the correct [`QuicMappedAddr`] and extracts DISCO
+    /// This fixes up the datagrams to use the correct [`NodeIdMappedAddr`] and extracts DISCO
     /// packets, processing them inside the magic socket.
     fn process_udp_datagrams(
         &self,
@@ -757,7 +759,7 @@ impl MagicSock {
 
         // Adding the IP address we received something on results in Quinn using this
         // address on the send path to send from.  However we let Quinn use a
-        // QuicMappedAddress, not a real address.  So we used to substitute our bind address
+        // NodeIdMappedAddress, not a real address.  So we used to substitute our bind address
         // here so that Quinn would send on the right address.  But that would sometimes
         // result in the wrong address family and Windows trips up on that.
         //
@@ -824,7 +826,7 @@ impl MagicSock {
             }
 
             if buf_contains_quic_datagrams {
-                // Update the NodeMap and remap RecvMeta to the QuicMappedAddr.
+                // Update the NodeMap and remap RecvMeta to the NodeIdMappedAddr.
                 match self.node_map.receive_udp(meta.addr) {
                     None => {
                         // Check if this address is used for QUIC address discovery
@@ -1594,6 +1596,7 @@ impl Handle {
             pconn6,
             disco_secrets: DiscoSecrets::default(),
             node_map,
+            ip_mapped_addrs: IpMappedAddrs::new(),
             relay_actor_sender: relay_actor_sender.clone(),
             udp_disco_sender,
             discovery,
@@ -2601,7 +2604,7 @@ impl Actor {
         let res = set.join_all().await;
         for addrs in res {
             addrs.iter().for_each(|addr| {
-                self.msock.node_map.add_qad_addr(*addr);
+                self.msock.ip_mapped_addrs.add(*addr);
             });
         }
     }
@@ -2842,12 +2845,14 @@ fn split_packets(transmit: &quinn_udp::Transmit) -> RelayContents {
 /// comes in as the inner [`SocketAddr`], in those interfaces we have to be careful to do
 /// the conversion to this type.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct QuicMappedAddr(pub(crate) SocketAddr);
+pub(crate) struct NodeIdMappedAddr(pub(crate) SocketAddr);
 
-/// Counter to always generate unique addresses for [`QuicMappedAddr`].
-static ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Counter to always generate unique addresses for [`NodeIdMappedAddr`].
+static NODE_ID_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-impl QuicMappedAddr {
+const MAPPED_ADDR_PORT: u16 = 12345;
+
+impl NodeIdMappedAddr {
     /// The Prefix/L of our Unique Local Addresses.
     const ADDR_PREFIXL: u8 = 0xfd;
     /// The Global ID used in our Unique Local Addresses.
@@ -2864,18 +2869,156 @@ impl QuicMappedAddr {
         addr[1..6].copy_from_slice(&Self::ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&Self::ADDR_SUBNET);
 
-        let counter = ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let counter = NODE_ID_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
         addr[8..16].copy_from_slice(&counter.to_be_bytes());
 
-        Self(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), 12345))
+        Self(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::from(addr)),
+            MAPPED_ADDR_PORT,
+        ))
     }
 }
 
-impl std::fmt::Display for QuicMappedAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "QuicMappedAddr({})", self.0)
+impl TryFrom<SocketAddr> for NodeIdMappedAddr {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SocketAddr) -> std::result::Result<Self, Self::Error> {
+        match value {
+            SocketAddr::V4(_) => anyhow::bail!("NodeIdMappedAddrs are all Ipv6, addr {value:?}"),
+            SocketAddr::V6(addr) => {
+                if addr.port() != MAPPED_ADDR_PORT {
+                    anyhow::bail!("not a mapped addr");
+                }
+                let octets = addr.ip().octets();
+                if octets[6..8] != NodeIdMappedAddr::ADDR_SUBNET {
+                    anyhow::bail!("not a NodeIdMappedAddr");
+                }
+                Ok(NodeIdMappedAddr(value))
+            }
+        }
     }
 }
+impl std::fmt::Display for NodeIdMappedAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NodeIdMappedAddr({})", self.0)
+    }
+}
+
+/// A mirror for the `NodeIdMappedAddr`, mapping a fake Ipv6 address with an actual IP address.
+///
+/// You can consider this as nothing more than a lookup key for an IP the [`MagicSock`] knows
+/// about.
+///
+/// And in our QUIC-facing socket APIs like [`AsyncUdpSocket`] it
+/// comes in as the inner [`SocketAddr`], in those interfaces we have to be careful to do
+/// the conversion to this type.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub(crate) struct IpMappedAddr(pub(crate) SocketAddr);
+
+/// Counter to always generate unique addresses for [`NodeIdMappedAddr`].
+static IP_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl IpMappedAddr {
+    /// The Prefix/L of our Unique Local Addresses.
+    const ADDR_PREFIXL: u8 = 0xfd;
+    /// The Global ID used in our Unique Local Addresses.
+    const ADDR_GLOBAL_ID: [u8; 5] = [21, 7, 10, 81, 11];
+    /// The Subnet ID used in our Unique Local Addresses.
+    const ADDR_SUBNET: [u8; 2] = [0, 1];
+
+    /// Generates a globally unique fake UDP address.
+    ///
+    /// This generates and IPv6 Unique Local Address according to RFC 4193.
+    pub(crate) fn generate() -> Self {
+        let mut addr = [0u8; 16];
+        addr[0] = Self::ADDR_PREFIXL;
+        addr[1..6].copy_from_slice(&Self::ADDR_GLOBAL_ID);
+        addr[6..8].copy_from_slice(&Self::ADDR_SUBNET);
+
+        let counter = IP_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+
+        Self(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::from(addr)),
+            MAPPED_ADDR_PORT,
+        ))
+    }
+}
+
+impl TryFrom<SocketAddr> for IpMappedAddr {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SocketAddr) -> std::result::Result<Self, Self::Error> {
+        match value {
+            SocketAddr::V4(_) => anyhow::bail!("IpMappedAddrs are all Ipv6, addr {value:?}"),
+            SocketAddr::V6(addr) => {
+                if addr.port() != MAPPED_ADDR_PORT {
+                    anyhow::bail!("not a mapped addr");
+                }
+                let octets = addr.ip().octets();
+                if octets[6..8] != IpMappedAddr::ADDR_SUBNET {
+                    anyhow::bail!("not an IpMappedAddr");
+                }
+                Ok(IpMappedAddr(value))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for IpMappedAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "IpMappedAddr({})", self.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+/// A Map of [`IpMappedAddrs`] to [`SocketAddrs`]
+pub(crate) struct IpMappedAddrs(Arc<std::sync::Mutex<BTreeMap<IpMappedAddr, SocketAddr>>>);
+
+impl IpMappedAddrs {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(BTreeMap::new())))
+    }
+
+    /// Add a [`SocketAddr`] to the map and the generated [`IpMappedAddr`] it is now associated with back.
+    ///
+    /// If this [`SocketAddr`] already exists in the map, it returns its associated [`IpMappedAddr`].
+    pub fn add(&self, ip_addr: SocketAddr) -> IpMappedAddr {
+        let mut map = self.0.lock().expect("poisoned");
+        for (mapped_addr, ip) in map.iter() {
+            if ip == &ip_addr {
+                return *mapped_addr;
+            }
+        }
+        let ip_mapped_addr = IpMappedAddr::generate();
+        map.insert(ip_mapped_addr, ip_addr);
+        ip_mapped_addr
+    }
+
+    /// Remove an [`IpMappedAddr`]/[`SocketAddr`] from the map.
+    pub fn remove(&self, mapped_addr: &IpMappedAddr) -> Option<SocketAddr> {
+        let mut map = self.0.lock().expect("poisoned");
+        map.remove(mapped_addr)
+    }
+
+    /// Get the [`IpMappedAddr`] for the given [`SocketAddr`].
+    pub fn get_mapped_addr(&self, ip_addr: SocketAddr) -> Option<IpMappedAddr> {
+        let map = self.0.lock().expect("poisoned");
+        for (mapped_addr, ip) in map.iter() {
+            if ip == &ip_addr {
+                return Some(*mapped_addr);
+            }
+        }
+        None
+    }
+
+    /// Get the [`SocketAddr`] for the given [`IpMappedAddr`].
+    pub fn get_ip_addr(&self, mapped_addr: &IpMappedAddr) -> Option<SocketAddr> {
+        let map = self.0.lock().expect("poisoned");
+        map.get(mapped_addr).map(|addr| *addr)
+    }
+}
+
 fn disco_message_sent(msg: &disco::Message) {
     match msg {
         disco::Message::Ping(_) => {
@@ -3943,7 +4086,7 @@ mod tests {
     async fn magicsock_connect(
         ep: &quinn::Endpoint,
         ep_secret_key: SecretKey,
-        addr: QuicMappedAddr,
+        addr: NodeIdMappedAddr,
         node_id: NodeId,
     ) -> Result<quinn::Connection> {
         // Endpoint::connect sets this, do the same to have similar behaviour.
@@ -3969,7 +4112,7 @@ mod tests {
     async fn magicsock_connect_with_transport_config(
         ep: &quinn::Endpoint,
         ep_secret_key: SecretKey,
-        addr: QuicMappedAddr,
+        addr: NodeIdMappedAddr,
         node_id: NodeId,
         transport_config: Arc<quinn::TransportConfig>,
     ) -> Result<quinn::Connection> {
@@ -3998,7 +4141,7 @@ mod tests {
         let msock_1 = magicsock_ep(secret_key_1.clone()).await.unwrap();
 
         // Generate an address not present in the NodeMap.
-        let bad_addr = QuicMappedAddr::generate();
+        let bad_addr = NodeIdMappedAddr::generate();
 
         // 500ms is rather fast here.  Running this locally it should always be the correct
         // timeout.  If this is too slow however the test will not become flaky as we are
